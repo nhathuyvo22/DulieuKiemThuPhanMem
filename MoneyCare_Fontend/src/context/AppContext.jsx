@@ -1,0 +1,674 @@
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import * as api from '../services/api';
+import { playNotificationSound, triggerHaptic, speakVietnamese, formatAmountToSpokenVietnamese } from '../utils/soundHaptic';
+
+const AppContext = createContext(null);
+export const useApp = () => useContext(AppContext);
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+export const fmt = (n) =>
+  typeof n === 'number' ? Math.abs(n).toLocaleString('vi-VN') + ' đ' : '0 đ';
+
+export const txType = (t) => {
+  if (t === 'INCOME' || t === 'THU') return 'income';
+  if (t === 'CHUYEN_TIEN') return 'transfer';
+  return 'expense';
+};
+
+const DEFAULT_CATEGORIES = [
+  { id: 1, categoryName: 'Lương', type: 'INCOME', emoji: '💼' },
+  { id: 2, categoryName: 'Ăn uống', type: 'EXPENSE', emoji: '🍜' },
+  { id: 3, categoryName: 'Mua sắm', type: 'EXPENSE', emoji: '🛒' },
+  { id: 4, categoryName: 'Giải trí', type: 'EXPENSE', emoji: '🎬' },
+  { id: 5, categoryName: 'Di chuyển', type: 'EXPENSE', emoji: '🚗' },
+  { id: 6, categoryName: 'Hóa đơn', type: 'EXPENSE', emoji: '🧾' },
+  { id: 7, categoryName: 'Sức khỏe', type: 'EXPENSE', emoji: '❤️' },
+  { id: 8, categoryName: 'Học tập', type: 'EXPENSE', emoji: '📚' },
+  { id: 9, categoryName: 'Thưởng', type: 'INCOME', emoji: '🎁' },
+  { id: 10, categoryName: 'Đầu tư', type: 'INCOME', emoji: '📈' },
+  { id: 11, categoryName: 'Khác', type: 'EXPENSE', emoji: '📌' },
+];
+
+// ── Provider ─────────────────────────────────────────────────────────────────
+export function AppProvider({ children }) {
+  // ── theme ──
+  const [themeMode, setThemeModeRaw] = useState(
+    () => localStorage.getItem('mc_theme') || 'system'
+  );
+
+  const applyTheme = useCallback((mode) => {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const isDark = mode === 'dark' || (mode === 'system' && prefersDark);
+    document.documentElement.classList.toggle('dark', isDark);
+  }, []);
+
+  const setThemeMode = (mode) => {
+    setThemeModeRaw(mode);
+    localStorage.setItem('mc_theme', mode);
+    applyTheme(mode);
+  };
+
+  useEffect(() => {
+    applyTheme(themeMode);
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const handler = () => { if (themeMode === 'system') applyTheme('system'); };
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, [themeMode, applyTheme]);
+
+  // ── backend / auth ──
+  const [isLive, setIsLive] = useState(false);
+  const [backendUp, setBackendUp] = useState(false);
+  const [user, setUser] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('moneycare_user') || 'null'); } catch { return null; }
+  });
+  const [token, setToken] = useState(() => localStorage.getItem('moneycare_jwt') || null);
+
+  // ── balance privacy ──
+  const [hideBalance, setHideBalance] = useState(false);
+
+  // ── notification settings (sound, haptic, voice) ──
+  const [notifSettings, setNotifSettings] = useState(() => {
+    try {
+      const saved = localStorage.getItem('mc_notif_settings');
+      return saved ? JSON.parse(saved) : { sound: true, haptic: true, voice: true };
+    } catch {
+      return { sound: true, haptic: true, voice: true };
+    }
+  });
+
+  const updateNotifSettings = useCallback((newSettings) => {
+    setNotifSettings(prev => {
+      const updated = { ...prev, ...newSettings };
+      localStorage.setItem('mc_notif_settings', JSON.stringify(updated));
+      return updated;
+    });
+  }, []);
+
+  // ── smart toast queue (deduplication, max 2 items, sound & haptic, action toast) ──
+  const [toasts, setToasts] = useState([]);
+  const toastId = useRef(0);
+  const recentToasts = useRef([]); // Theo dõi tin nhắn gần nhất để chống trùng lặp
+
+  const toast = useCallback((msg, type = 'success', options = {}) => {
+    if (!msg) return;
+
+    // 1. Chống trùng lặp (Deduplication): Bỏ qua nếu tin nhắn giống hệt xuất hiện trong vòng 2.5s
+    const now = Date.now();
+    const isDuplicate = recentToasts.current.some(
+      r => r.msg === msg && (now - r.time) < 2500
+    );
+    if (isDuplicate) return;
+
+    recentToasts.current = [
+      ...recentToasts.current.filter(r => (now - r.time) < 3000),
+      { msg, time: now }
+    ];
+
+    // 2. Sound & Haptic Feedback theo cấu hình người dùng
+    if (notifSettings.sound) {
+      playNotificationSound(type);
+    }
+    if (notifSettings.haptic) {
+      triggerHaptic(type);
+    }
+    // 2.1. AI Voice Notification (nếu có yêu cầu đọc văn bản hoặc truyền voiceText)
+    if (notifSettings.voice && options.voiceText) {
+      speakVietnamese(options.voiceText);
+    }
+
+    // 3. Tối ưu thời gian tự ẩn: success/info 2.5s, error/warning 4s (hoặc tùy chỉnh qua options.duration)
+    const duration = options.duration || (type === 'error' || type === 'warning' ? 4000 : 2500);
+    const id = ++toastId.current;
+    const action = options.action || null; // { label: string, onClick: function }
+
+    // 4. Giới hạn số lượng (Max queue): Tối đa 2 thông báo cùng một lúc
+    setToasts(prev => {
+      const trimmed = prev.length >= 2 ? prev.slice(-1) : prev;
+      return [...trimmed, { id, msg, type, action }];
+    });
+
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, duration);
+  }, [notifSettings]);
+
+  // ── admin role check ──
+  // id_vai_tro = 1 là ADMIN, id_vai_tro = 2 là USER (theo bảng VaiTro trong DB)
+  const isAdmin = Boolean(
+    user && (
+      user.roleId === 1 ||
+      user.role === 'ADMIN' ||
+      user.role === 'SUPER_ADMIN' ||
+      (Array.isArray(user.authorities) && user.authorities.some(a => a === 'ROLE_ADMIN'))
+    )
+  );
+
+  // ── app mode: 'user' | 'admin' ──
+  const [appMode, setAppModeRaw] = useState(() => {
+    const saved = localStorage.getItem('mc_app_mode');
+    return saved === 'admin' ? 'admin' : 'user';
+  });
+
+  const setAppMode = useCallback((mode) => {
+    if (mode === 'admin' && !isAdmin) {
+      toast('Tài khoản của bạn không có quyền Quản trị (Admin)!', 'error');
+      return;
+    }
+    localStorage.setItem('mc_app_mode', mode);
+    setAppModeRaw(mode);
+  }, [isAdmin, toast]);
+
+  // ── current screen (persisted to localStorage) ──
+  const VALID_SCREENS = ['overview', 'transactions', 'budget', 'goals', 'interest', 'accounts', 'reports', 'bills', 'settings'];
+  const [screen, setScreenRaw] = useState(() => {
+    const saved = localStorage.getItem('mc_screen');
+    return VALID_SCREENS.includes(saved) ? saved : 'overview';
+  });
+
+  const setScreen = useCallback((id) => {
+    if (VALID_SCREENS.includes(id)) {
+      localStorage.setItem('mc_screen', id);
+    }
+    setScreenRaw(id);
+  }, []);
+
+  // ── sidebar open (mobile) ──
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // ── data (100% dữ liệu thực từ Backend, mặc định rỗng []) ──
+  const [accounts, setAccounts] = useState([]);
+  const [transactions, setTransactions] = useState([]);
+  const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
+  const [budgets, setBudgets] = useState([]);
+  const [savingsGoals, setSavingsGoals] = useState([]);
+  const [bills, setBills] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+
+  // ── loading ──
+  const [loading, setLoading] = useState({});
+  const setLoad = (key, val) => setLoading(prev => ({ ...prev, [key]: val }));
+
+
+  // ── probe backend ──
+  const probeBackend = useCallback(async () => {
+    const up = await api.checkHealth();
+    setBackendUp(up);
+    if (up && token) {
+      setIsLive(true);
+    }
+    return up;
+  }, [token]);
+
+  useEffect(() => { probeBackend(); }, [probeBackend]);
+
+  // Định kỳ gửi Heartbeat mỗi 45 giây khi đã đăng nhập
+  useEffect(() => {
+    if (!token) return;
+    // Gửi ngay 1 lần
+    api.sendHeartbeat().catch(() => {});
+    const interval = setInterval(() => {
+      api.sendHeartbeat().catch(() => {});
+    }, 45000);
+    return () => clearInterval(interval);
+  }, [token]);
+
+  // handle unauthorized event
+  useEffect(() => {
+    const handler = () => {
+      setToken(null);
+      setUser(null);
+      setIsLive(false);
+      setAccounts([]);
+      setTransactions([]);
+      setBudgets([]);
+      setSavingsGoals([]);
+      setBills([]);
+      setNotifications([]);
+      localStorage.removeItem('moneycare_jwt');
+      localStorage.removeItem('moneycare_user');
+      toast('Phiên đăng nhập hết hạn. Vui lòng đăng nhập lại.', 'error');
+    };
+    window.addEventListener('mc:unauthorized', handler);
+    return () => window.removeEventListener('mc:unauthorized', handler);
+  }, [toast]);
+
+  // ── sync from backend ──
+  const syncAll = useCallback(async () => {
+    if (!token) return;
+    setLoad('sync', true);
+    try {
+      const [accs, txs, cats, buds, goals, bls, notifs, stxs] = await Promise.allSettled([
+        api.getAccounts(), api.getTransactions(), api.getCategories(),
+        api.getBudgets(), api.getSavingsGoals(), api.getBills(), api.getNotifications(),
+        api.getSavingsTx(),
+      ]);
+      if (accs.status === 'fulfilled' && Array.isArray(accs.value)) setAccounts(accs.value);
+      if (txs.status === 'fulfilled' && Array.isArray(txs.value)) setTransactions(txs.value);
+      if (cats.status === 'fulfilled' && Array.isArray(cats.value)) setCategories(cats.value);
+      if (buds.status === 'fulfilled' && Array.isArray(buds.value)) setBudgets(buds.value);
+      if (goals.status === 'fulfilled' && Array.isArray(goals.value)) {
+        const savingsTxList = (stxs.status === 'fulfilled' && Array.isArray(stxs.value)) ? stxs.value : [];
+        setSavingsGoals(goals.value.map(g => {
+          const goalTxs = savingsTxList.filter(st => st.goalId === g.id);
+          const savedAmount = goalTxs.reduce((sum, st) => {
+            const amt = Number(st.amount) || 0;
+            return st.movementType === 'RUT' ? sum - amt : sum + amt;
+          }, 0);
+          return {
+            ...g,
+            name: g.name || g.goalName,
+            goalName: g.goalName || g.name,
+            currentAmount: g.currentAmount != null && g.currentAmount > 0 ? Number(g.currentAmount) : savedAmount,
+          };
+        }));
+      }
+      if (bls.status === 'fulfilled' && Array.isArray(bls.value)) setBills(bls.value);
+      if (notifs.status === 'fulfilled' && Array.isArray(notifs.value)) setNotifications(notifs.value);
+    } catch (e) {
+      toast('Lỗi đồng bộ dữ liệu: ' + e.message, 'error');
+    } finally {
+      setLoad('sync', false);
+    }
+  }, [token, toast]);
+
+  // Tự động đồng bộ dữ liệu thực khi có token
+  useEffect(() => {
+    if (token) {
+      setIsLive(true);
+      syncAll();
+    } else {
+      setIsLive(false);
+      setAccounts([]);
+      setTransactions([]);
+      setBudgets([]);
+      setSavingsGoals([]);
+      setBills([]);
+      setNotifications([]);
+    }
+  }, [token, syncAll]);
+
+  // ── login ──
+  const doLogin = useCallback(async (email, password) => {
+    setLoad('auth', true);
+    try {
+      const res = await api.login(email, password);
+      if (!res.accessToken) throw new Error('Không nhận được token');
+      localStorage.setItem('moneycare_jwt', res.accessToken);
+      localStorage.setItem('moneycare_user', JSON.stringify(res.user));
+      setToken(res.accessToken);
+      setUser(res.user);
+      setIsLive(true);
+      setBackendUp(true);
+      const adminRoles = res.user?.authorities || [];
+      const loginIsAdmin = Number(res.user?.roleId) === 1
+        || adminRoles.includes('ROLE_ADMIN')
+        || adminRoles.includes('ADMIN');
+      const loginMode = loginIsAdmin ? 'admin' : 'user';
+      localStorage.setItem('mc_app_mode', loginMode);
+      setAppModeRaw(loginMode);
+      if (loginIsAdmin) {
+        localStorage.setItem('mc_admin_screen', 'dashboard');
+      }
+
+      // Đồng bộ dữ liệu tài khoản từ backend
+      await syncAll();
+      toast(`Chào mừng ${res.user?.fullName || res.user?.email}!`);
+      return true;
+    } catch (e) {
+      toast('Đăng nhập thất bại: ' + e.message, 'error');
+      return false;
+    } finally {
+      setLoad('auth', false);
+    }
+  }, [syncAll, toast]);
+
+  // ── register ──
+  const doRegister = useCallback(async (data) => {
+    setLoad('auth', true);
+    try {
+      await api.register(data);
+      const ok = await doLogin(data.email, data.password);
+      return ok;
+    } catch (e) {
+      toast('Đăng ký thất bại: ' + e.message, 'error');
+      return false;
+    } finally {
+      setLoad('auth', false);
+    }
+  }, [doLogin, toast]);
+
+  // ── logout ──
+  const doLogout = useCallback(async () => {
+    try { await api.logout(); } catch (e) { /* ignore */ }
+    localStorage.removeItem('moneycare_jwt');
+    localStorage.removeItem('moneycare_user');
+    localStorage.removeItem('mc_screen');
+    localStorage.removeItem('mc_app_mode');
+    localStorage.removeItem('mc_admin_screen');
+    setToken(null);
+    setUser(null);
+    setIsLive(false);
+    setAppModeRaw('user');
+    setAccounts([]);
+    setTransactions([]);
+    setBudgets([]);
+    setSavingsGoals([]);
+    setBills([]);
+    setNotifications([]);
+    setScreenRaw('overview');
+    toast('Đã đăng xuất thành công.');
+  }, [toast]);
+
+  // ── add transaction ──
+  const addTransaction = useCallback(async (payload) => {
+    setLoad('tx', true);
+    try {
+      if (isLive && token) {
+        await api.createTransaction(payload);
+        await syncAll();
+      } else {
+        // demo mode — in-memory
+        const id = Date.now();
+        setTransactions(prev => [{ ...payload, id, createdAt: new Date().toISOString() }, ...prev]);
+        // adjust account balance
+        const signedAmt = payload.type === 'INCOME' ? payload.amount : -payload.amount;
+        setAccounts(prev => prev.map(a =>
+          a.id === payload.accountId ? { ...a, balance: (a.balance || 0) + signedAmt } : a
+        ));
+      }
+      toast('Đã lưu giao dịch thành công! 🎉');
+    } catch (e) {
+      toast('Lỗi: ' + e.message, 'error');
+    } finally {
+      setLoad('tx', false);
+    }
+  }, [isLive, token, syncAll]);
+
+  // ── delete transaction ──
+  const deleteTransaction = useCallback(async (tx) => {
+    setLoad('delTx', true);
+    try {
+      if (isLive && token) {
+        await api.deleteTransaction(tx.id);
+        await syncAll();
+      } else {
+        setTransactions(prev => prev.filter(t => t.id !== tx.id));
+        const signedAmt = tx.type === 'INCOME' ? -tx.amount : tx.amount;
+        setAccounts(prev => prev.map(a =>
+          a.id === tx.accountId ? { ...a, balance: (a.balance || 0) + signedAmt } : a
+        ));
+      }
+      toast('Đã xóa giao dịch thành công!', 'info', {
+        action: {
+          label: 'Hoàn tác ↩',
+          onClick: async () => {
+            const { id, createdAt, updatedAt, ...rest } = tx;
+            await addTransaction(rest);
+          }
+        }
+      });
+    } catch (e) {
+      toast('Lỗi xóa: ' + e.message, 'error');
+    } finally {
+      setLoad('delTx', false);
+    }
+  }, [isLive, token, syncAll, addTransaction, toast]);
+
+  // ── add account ──
+  const addAccount = useCallback(async (data) => {
+    try {
+      if (isLive && token) {
+        await api.createAccount(data);
+        const accs = await api.getAccounts();
+        setAccounts(accs);
+      } else {
+        setAccounts(prev => [...prev, { ...data, id: Date.now(), status: 'ACTIVE' }]);
+      }
+      toast('Đã thêm tài khoản thành công!');
+    } catch (e) {
+      toast('Lỗi: ' + e.message, 'error');
+    }
+  }, [isLive, token]);
+
+  // ── deposit / top up account ──
+  const depositAccount = useCallback(async ({ accountId, amount, note, source }) => {
+    setLoad('deposit', true);
+    try {
+      const acc = accounts.find(a => a.id === Number(accountId));
+      const accName = acc?.accountName || 'Ví';
+      const numAmt = Number(amount);
+      const title = note || `Nạp tiền vào ${accName}`;
+
+      const payload = {
+        accountId: Number(accountId),
+        amount: numAmt,
+        type: 'INCOME',
+        categoryId: categories.find(c => c.categoryType === 'THU' || c.type === 'INCOME')?.id || 1,
+        title,
+        description: note || `Nạp tiền qua ${source || 'Chuyển khoản'}`,
+        transactionDate: new Date().toISOString(),
+      };
+
+      if (isLive && token) {
+        await api.createTransaction(payload);
+        await syncAll();
+      } else {
+        const id = Date.now();
+        setTransactions(prev => [{ ...payload, id, createdAt: new Date().toISOString() }, ...prev]);
+        setAccounts(prev => prev.map(a =>
+          a.id === Number(accountId) ? { ...a, balance: (a.balance || 0) + numAmt } : a
+        ));
+      }
+      const spokenAmt = formatAmountToSpokenVietnamese(numAmt);
+      toast(`Nạp thành công +${numAmt.toLocaleString('vi-VN')} đ vào ${accName}! 🎉`, 'success', {
+        voiceText: `Tài khoản ${accName} đã được nạp thành công ${spokenAmt}.`
+      });
+      return true;
+    } catch (e) {
+      toast('Lỗi nạp tiền: ' + e.message, 'error');
+      return false;
+    } finally {
+      setLoad('deposit', false);
+    }
+  }, [accounts, categories, isLive, token, syncAll, toast]);
+
+  // ── add budget ──
+  const addBudget = useCallback(async (data) => {
+    try {
+      if (isLive && token) {
+        await api.createBudget(data);
+        const b = await api.getBudgets();
+        setBudgets(b);
+      } else {
+        setBudgets(prev => [...prev, { ...data, id: Date.now() }]);
+      }
+      toast('Đã tạo ngân sách thành công! 🎯');
+    } catch (e) {
+      toast('Lỗi: ' + e.message, 'error');
+    }
+  }, [isLive, token, toast]);
+
+  // ── delete budget ──
+  const deleteBudget = useCallback(async (id) => {
+    try {
+      if (isLive && token) {
+        await api.deleteBudget(id);
+        setBudgets(prev => prev.filter(b => b.id !== id));
+      } else {
+        setBudgets(prev => prev.filter(b => b.id !== id));
+      }
+      toast('Đã xóa ngân sách.');
+    } catch (e) {
+      toast('Lỗi: ' + e.message, 'error');
+    }
+  }, [isLive, token]);
+
+  // ── add savings goal ──
+  const addSavingsGoal = useCallback(async (data) => {
+    try {
+      const gName = data.name || data.goalName || '';
+      const payload = {
+        name: gName,
+        goalName: gName,
+        userId: user?.id,
+        targetAmount: Number(data.targetAmount),
+        startDate: data.startDate || new Date().toISOString().split('T')[0],
+        targetDate: data.targetDate || null,
+        description: data.description || '',
+        status: data.status || 'ACTIVE',
+      };
+
+      if (isLive && token) {
+        const created = await api.createSavingsGoal(payload);
+        await syncAll();
+        toast('Đã tạo mục tiêu tiết kiệm thành công! 🎯');
+        return created;
+      } else {
+        const newGoal = {
+          ...payload,
+          id: Date.now(),
+          currentAmount: Number(data.currentAmount) || 0,
+          status: 'ACTIVE'
+        };
+        setSavingsGoals(prev => [...prev, newGoal]);
+        toast('Đã tạo mục tiêu tiết kiệm thành công! 🎯');
+        return newGoal;
+      }
+    } catch (e) {
+      toast('Lỗi: ' + e.message, 'error');
+      return false;
+    }
+  }, [isLive, token, syncAll, toast]);
+
+  // ── deposit savings ──
+  const depositSavings = useCallback(async (goalId, amount, accountId) => {
+    try {
+      if (isLive && token) {
+        await api.createSavingsTx({
+          goalId,
+          amount,
+          accountId,
+          movementType: 'NAP',
+          transactionDate: new Date().toISOString(),
+          note: 'Nạp tiền tích lũy mục tiêu'
+        });
+        await syncAll();
+      } else {
+        setSavingsGoals(prev => prev.map(g =>
+          g.id === goalId ? { ...g, currentAmount: (g.currentAmount || 0) + amount } : g
+        ));
+        setAccounts(prev => prev.map(a =>
+          a.id === accountId ? { ...a, balance: Math.max(0, (a.balance || 0) - amount) } : a
+        ));
+      }
+      const spokenAmt = formatAmountToSpokenVietnamese(amount);
+      toast(`Đã nạp ${fmt(amount)} vào hũ tiết kiệm! 💰`, 'success', {
+        voiceText: `Bạn đã nạp thành công ${spokenAmt} vào quỹ tiết kiệm.`
+      });
+      return true;
+    } catch (e) {
+      toast('Lỗi: ' + e.message, 'error');
+      return false;
+    }
+  }, [isLive, token, syncAll, fmt, toast]);
+
+  // ── add bill ──
+  const addBill = useCallback(async (data) => {
+    try {
+      if (isLive && token) {
+        await api.createBill(data);
+        const b = await api.getBills();
+        setBills(b);
+      } else {
+        setBills(prev => [...prev, { ...data, id: Date.now(), status: 'PENDING' }]);
+      }
+      toast('Đã thêm hóa đơn!');
+      return true;
+    } catch (e) {
+      toast('Lỗi: ' + e.message, 'error');
+      return false;
+    }
+  }, [isLive, token]);
+
+  // ── pay bill ──
+  const payBill = useCallback(async (bill, accountId) => {
+    setLoad('billPayment', true);
+    try {
+      const amt = Number(bill.amount || bill.expectedAmount) || 0;
+      if (isLive && token) {
+        await api.createBillPayment({ billId: bill.id, accountId, amount: amt, paymentDate: new Date().toISOString() });
+        await syncAll();
+      } else {
+        const account = accounts.find(item => item.id === accountId);
+        if (!account || account.balance < amt) {
+          throw new Error('Tài khoản không tồn tại hoặc số dư không đủ để thanh toán.');
+        }
+        setAccounts(prev => prev.map(item =>
+          item.id === accountId ? { ...item, balance: item.balance - amt } : item
+        ));
+        setBills(prev => prev.map(b => b.id === bill.id ? { ...b, status: 'PAID' } : b));
+      }
+      const spokenAmt = formatAmountToSpokenVietnamese(amt);
+      toast(`Đã thanh toán hóa đơn "${bill.name || bill.billName || 'Hóa đơn'}" thành công! 🎉`, 'success', {
+        voiceText: `Tài khoản của bạn đã thanh toán thành công ${spokenAmt}.`
+      });
+      return true;
+    } catch (e) {
+      toast('Lỗi: ' + e.message, 'error');
+      return false;
+    } finally {
+      setLoad('billPayment', false);
+    }
+  }, [accounts, isLive, token, syncAll, toast]);
+
+  // ── mark notification read ──
+  const markNotifRead = useCallback((id) => {
+    setNotifications(prev => prev.map(n => n.id === id ? { ...n, isRead: true } : n));
+  }, []);
+
+  // ── computed stats ──
+  const totalNetWorth = accounts.filter(a => a.status !== 'ARCHIVED').reduce((s, a) => s + (a.balance || 0), 0);
+  const monthlyIncome = transactions
+    .filter(t => txType(t.type) === 'income' && new Date(t.transactionDate).getMonth() === new Date().getMonth())
+    .reduce((s, t) => s + (t.amount || 0), 0);
+  const monthlyExpense = transactions
+    .filter(t => txType(t.type) === 'expense' && new Date(t.transactionDate).getMonth() === new Date().getMonth())
+    .reduce((s, t) => s + (t.amount || 0), 0);
+  const unreadCount = notifications.filter(n => !n.isRead).length;
+
+  return (
+    <AppContext.Provider value={{
+      // theme
+      themeMode, setThemeMode,
+      // auth / backend
+      isLive, backendUp, user, token, isAdmin, appMode, setAppMode,
+      doLogin, doRegister, doLogout, probeBackend, syncAll,
+      // screen
+      screen, setScreen,
+      sidebarOpen, setSidebarOpen,
+      // privacy
+      hideBalance, setHideBalance,
+      // data
+      accounts, transactions, categories, budgets,
+      savingsGoals, bills, notifications,
+      // actions
+      addTransaction, deleteTransaction,
+      addAccount, depositAccount, addBudget, deleteBudget,
+      addSavingsGoal, depositSavings,
+      addBill, payBill,
+      markNotifRead,
+      // computed
+      totalNetWorth, monthlyIncome, monthlyExpense,
+      remaining: totalNetWorth,
+      unreadCount,
+      // ui helpers
+      loading, toast,
+      toasts, setToasts,
+      notifSettings, updateNotifSettings,
+      fmt, txType,
+    }}>
+      {children}
+    </AppContext.Provider>
+  );
+}
